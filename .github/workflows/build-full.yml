@@ -1,0 +1,117 @@
+name: Build full firmware (25.12.6 + NFQUEUE + big rootfs)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git build-essential clang flex bison g++ \
+            python3 python3-distutils python3-setuptools python3-dev python3-pip \
+            rsync unzip wget file zstd libelf-dev bc gawk gettext libncurses-dev \
+            libssl-dev swig time ecj fastjar default-jdk-headless cmake libatomic1 \
+            libtool-bin perl quilt patchelf pkgconf libreadline-dev libffi-dev \
+            libgdbm-dev libdb-dev uuid-dev texinfo help2man libsdl1.2-dev
+
+      - name: Cache dl / toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            dl
+            staging_dir
+          key: fmw-25126-full-${{ hashFiles('config.seed', '.github/workflows/build-full.yml') }}
+          restore-keys: fmw-25126-full-
+
+      - name: Setup feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Add third-party package sources
+        run: |
+          set +e
+          # nikki / mihomo
+          git clone --depth 1 https://github.com/nikkinikki-org/OpenWrt-nikki.git /tmp/nikki
+          find /tmp/nikki -maxdepth 3 -name Makefile -printf '%h\n' | while read d; do cp -r "$d" package/ 2>/dev/null; done
+          # lucky
+          git clone --depth 1 https://github.com/gdy666/luci-app-lucky.git /tmp/lucky
+          find /tmp/lucky -maxdepth 3 -name Makefile -printf '%h\n' | while read d; do cp -r "$d" package/ 2>/dev/null; done
+          # adguardhome luci
+          git clone --depth 1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/agh
+          find /tmp/agh -maxdepth 3 -name Makefile -printf '%h\n' | while read d; do cp -r "$d" package/ 2>/dev/null; done
+          echo "=== extra package dirs ==="
+          ls package/ | grep -iE 'nikki|mihomo|lucky|adguard' || true
+          set -e
+
+      - name: Configure
+        run: |
+          cp config.seed .config
+          make defconfig
+          echo "=== NFQUEUE selected ==="
+          grep -E 'CONFIG_PACKAGE_kmod-(nfnetlink-queue|nft-queue|ipt-nfqueue)=' .config || echo "!!! NFQUEUE NOT SELECTED"
+          echo "=== rootfs part size ==="
+          grep -E 'CONFIG_TARGET_(ROOTFS|KERNEL)_PARTSIZE=' .config
+          echo "=== selected package count ==="
+          grep -c '^CONFIG_PACKAGE_.*=y' .config
+          echo "=== key packages ==="
+          grep -E '^CONFIG_PACKAGE_(docker|nikki|lucky|adguardhome|tailscale|zerotier|luci-app-fwx-dashboard)=' .config || true
+          cp .config config.build
+
+      - name: Upload resolved config
+        uses: actions/upload-artifact@v4
+        with:
+          name: config
+          path: config.build
+
+      - name: Build
+        run: |
+          set -o pipefail
+          make -j$(nproc) > /tmp/build.log 2>&1 || {
+            echo "=== BUILD FAILED, last 150 lines ==="
+            tail -150 /tmp/build.log
+            echo "=== first errors ==="
+            grep -nE 'Error|error:|No such|cannot|failed' /tmp/build.log | head -40
+            exit 1
+          }
+          tail -30 /tmp/build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: ignore
+
+      - name: Collect images
+        if: success()
+        run: |
+          mkdir -p out
+          find bin/targets/x86/64 -maxdepth 1 -type f \( -name '*.img.gz' -o -name '*.img' \) -exec cp -v {} out/ \;
+          cp config.build out/
+          ls -lh out/
+
+      - name: Upload firmware
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fanchmwrt-25.12.6-full
+          path: out/
+          if-no-files-found: error
